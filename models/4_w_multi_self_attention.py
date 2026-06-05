@@ -1,3 +1,5 @@
+import json
+import pathlib
 import torch # for tensor operations
 import torch.nn as nn # for building neural networks
 from torch.nn import functional as F # for activation functions and other functional operations
@@ -5,9 +7,9 @@ from torch.nn import functional as F # for activation functions and other functi
 
 batch_size = 32 # how many independent sequences will we process in parallel?
 block_size = 8 # what is the maximum context length for predictions?
-max_iters = 3000 # how many training iterations?
-eval_interval = 300 # how often to evaluate the model?
-learning_rate = 1e-2 # learning rate for optimization
+max_iters = 5000 # how many training iterations?
+eval_interval = 500 # how often to evaluate the model?
+learning_rate = 1e-3 # learning rate for optimization
 device = torch.device('mps') # device to run the model on (GPU if available, otherwise CPU)
 eval_iters = 200 # number of iterations to evaluate the model
 n_embed = 32 # size of the embedding vectors
@@ -64,19 +66,55 @@ def estimate_loss(): # function to estimate the loss on the training and validat
     model.train() # set the model back to training mode before returning
     return out # return the dictionary containing the estimated losses 
 
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embed, head_size, bias=False)
+        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B,T,C = x.shape
+        k = self.key(x)   # (B,T,head_size)
+        q = self.query(x) # (B,T,head_size)
+        v = self.value(x) # (B,T,head_size)
+        wei = q @ k.transpose(-2,-1) * C**-0.5 # (B,T,head_size) @ (B, head_size, T) -> (B,T,T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B,T,T)
+        wei = F.softmax(wei, dim=-1) # (B,T,T)
+        out = wei @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
+        return out
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)]) # create a list of self attention heads
+        #self.proj = nn.Linear(n_embed, n_embed) # create a linear layer to project the concatenated outputs of the heads back to the original embedding size
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1) # concatenate the outputs of all the heads along the last dimension
+        #out = self.proj(out) # project the concatenated output back to the original embedding size
+        return out
+    
+
 class BigramLanguageModel(nn.Module): # define the bigram language model class
-    def __init__(self,vocab_size):
+    def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed) # # create an embedding layer that maps each token to a vector of size n_embed
+        self.position_embedding_table = nn.Embedding(block_size, n_embed) # create an embedding layer that maps each position in the input sequence to a vector of size n_embed
         ## in here we don't want to get logits directly from the embedding table, we want to pass it through a feed forward network to get the logits, so we need to define that as well
+        self.sa_heads = MultiHeadAttention(num_heads=4, head_size=n_embed//4) # create a multi-head self attention layer (for simplicity, we will use 4 heads and divide the embedding size accordingly)
         self.lm_head = nn.Linear(n_embed, vocab_size) # create a linear layer that maps the embedding vectors to the vocabulary size (logits for each token)
 
-
-
-
     def forward(self, idx, targets=None):
+        
+        B, T = idx.shape # get the batch size and sequence length from the shape of the input indices
         tok_emb = self.token_embedding_table(idx) # get the token embeddings for the input indices
-        logits = self.lm_head(tok_emb) # pass the token embeddings through the linear layer to get the logits
+        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) # get the position embeddings for each position in the input sequence
+        x = tok_emb + pos_emb # combine the token and position embeddings by element-wise addition
+        x = self.sa_heads(x) # apply the multi-head self attention to the combined embeddings
+        logits = self.lm_head(x) # pass the combined embeddings through the linear layer to get the logits
+        
         if targets is None: # if no targets are provided, return the logits and None for loss
             loss = None
         else:
@@ -88,21 +126,29 @@ class BigramLanguageModel(nn.Module): # define the bigram language model class
     
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens): # loop over the number of new tokens to generate
-            logits, loss = self(idx) # get the logits for the current input indices
+            idx_cond = idx[:, -block_size:] # get the last block_size tokens from the input indices to use as context for generation
+            logits, loss = self(idx_cond) # get the logits for the current input indices
             logits = logits[:, -1, :] # focus on the last time step's logits (the most recent token)
             probs = F.softmax(logits, dim=-1) # convert logits to probabilities using softmax
             idx_next = torch.multinomial(probs, num_samples=1) # sample the next token index from the probability distribution
             idx = torch.cat((idx, idx_next), dim=1) # append the new token index to the input indices for the next iteration
-        return idx # return the generated sequence of indices 
+        return idx # return the generated sequence of indices   
 
 
 ## vocab_size is a global variable so no need to pass it as an argument to the model, we can just use it directly in the model definition
 model = BigramLanguageModel().to(device) # create an instance of the bigram language model and move it to the specified device
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate) # create an AdamW optimizer to update the model parameters during training
 
+_losses_dir = pathlib.Path(__file__).parent.parent / 'losses'
+_losses_dir.mkdir(exist_ok=True)
+_loss_file = _losses_dir / f'{pathlib.Path(__file__).stem}.json'
+_loss_history = []
+
 for iter in range(max_iters): # loop over the number of training iterations
     if iter % eval_interval == 0: # if it's time to evaluate the model
         losses = estimate_loss() # estimate the loss on the training and validation sets
+        _loss_history.append({'step': iter, 'train': losses['train'].item(), 'val': losses['val'].item()})
+        _loss_file.write_text(json.dumps(_loss_history, indent=2))
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}") # print the current step and the estimated losses
     
     xb, yb = get_batch('train') # get a batch of training data
